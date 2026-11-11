@@ -1,2 +1,9 @@
 .worktrees/
 _b64_values.json
+
+# Credential / auth helpers — never commit tokens or credential scripts
+.git-credential-*.sh
+*.token
+*.pem
+.env
+.env.*
