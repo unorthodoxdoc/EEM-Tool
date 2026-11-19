@@ -21,8 +21,8 @@ embedded binary.
     Microsoft's license terms.
   - Formatting the USB drive erases all data on it.
   - Requires Administrator privileges.
-  - A WinPE source folder is required (either manually specified or installed via
-    the winget checkbox) to make the USB bootable.
+  - If no WinPE source is specified, the tool automatically downloads and installs
+    the ADK PE Addon via winget, then locates boot.wim on disk.
   - bootsect /nt60 is used (modern bootmgr-based WinPE). /nt52 is not used as it
     is for legacy NTLDR boot and will make ADK WinPE unbootable.
   - Automatic startnet execution requires patching boot.wim; the script copies
@@ -99,7 +99,6 @@ $jobScript = {
         [string]$UsbDrive,
         [string]$WinPeSource,
         [bool]$FormatUsb,
-        [bool]$InstallWinget,
         [string]$WorkingDir
     )
 
@@ -114,42 +113,63 @@ $jobScript = {
             throw "USB drive $UsbDrive is not accessible."
         }
 
-        # --- Optional: Install ADK PE Addon via winget ---
-        if ($InstallWinget) {
-            Send-Status "Installing ADK PE Addon via winget..."
-            Send-Progress 10
-            $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
-            if (-not $winget) {
-                throw "winget.exe not found. Install the Windows ADK first."
-            }
-            & $winget install --id Microsoft.ADKPEAddon -e --accept-package-agreements --accept-source-agreements 2>&1
-            if ($LASTEXITCODE -ne 0) {
-                throw "winget install failed with exit code $LASTEXITCODE."
-            }
-
+        # --- Prepare WinPE source (auto-install via winget if needed) ---
+        if (-not $WinPeSource -or -not (Test-Path $WinPeSource)) {
+            # Check if a WinPE source already exists on disk
             $adkPaths = @(
                 "${env:ProgramFiles(x86)}\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment\amd64\Media",
                 "${env:ProgramFiles}\Windows Kits\10\Assessment and Deployment Kit\Windows Preinstallation Environment\amd64\Media"
             )
-            $found = $false
+            $autoWinPe = $null
             foreach ($p in $adkPaths) {
                 if (Test-Path $p) {
                     $bw = Get-ChildItem -Path $p -Filter boot.wim -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
                     if ($bw) {
-                        $WinPeSource = Split-Path $bw.FullName -Parent
-                        Send-Status "Found WinPE source: $WinPeSource"
-                        $found = $true
+                        $autoWinPe = Split-Path $bw.FullName -Parent
                         break
                     }
                 }
             }
-            if (-not $found) {
-                throw "winget installed but no boot.wim found in ADK directories."
+            if ($autoWinPe) {
+                $WinPeSource = $autoWinPe
+                Send-Status "Found existing WinPE source: $WinPeSource"
+                Send-Progress 20
+            } else {
+                # Winget install is required
+                Send-Status "No WinPE found. Installing ADK PE Addon via winget..."
+                Send-Progress 15
+                $winget = Get-Command winget.exe -ErrorAction SilentlyContinue
+                if (-not $winget) {
+                    throw "winget.exe not found. Cannot install ADK PE Addon."
+                }
+                $wingetOutput = & $winget install --id Microsoft.ADKPEAddon -e --accept-package-agreements --accept-source-agreements 2>&1
+                if ($LASTEXITCODE -ne 0) {
+                    throw "winget install failed with exit code $LASTEXITCODE."
+                }
+                Send-Status "winget installation complete. Locating boot.wim..."
+                Send-Progress 25
+
+                $found = $false
+                foreach ($p in $adkPaths) {
+                    if (Test-Path $p) {
+                        $bw = Get-ChildItem -Path $p -Filter boot.wim -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+                        if ($bw) {
+                            $WinPeSource = Split-Path $bw.FullName -Parent
+                            Send-Status "Found WinPE source: $WinPeSource"
+                            Send-Progress 30
+                            $found = $true
+                            break
+                        }
+                    }
+                }
+                if (-not $found) {
+                    throw "winget installed but no boot.wim found in ADK directories."
+                }
             }
         }
 
         # --- Validate WinPE source ---
-        if ($WinPeSource) {
+        if ($WinPeSource -and (Test-Path $WinPeSource)) {
             if (-not (Test-Path $WinPeSource)) {
                 throw "WinPE source folder not found: $WinPeSource"
             }
@@ -161,6 +181,8 @@ $jobScript = {
             if (-not $hasIndicator) {
                 Send-Status "Warning: WinPE source lacks expected boot files."
             }
+        } else {
+            throw "No WinPE source available. Please install the ADK PE Addon or specify a WinPE source folder."
         }
 
         # --- Format USB ---
@@ -235,7 +257,7 @@ Add-Type -AssemblyName System.Drawing
 $form = New-Object System.Windows.Forms.Form
 $form.Text = "Autopilot USB Creator"
 $form.Size = New-Object System.Drawing.Size(600, 500)
-$form.CenterScreen = $true
+$form.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
 $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
 $form.MaximizeBox = $false
 $form.AutoScaleMode = [System.Windows.Forms.AutoScaleMode]::Font
@@ -249,9 +271,9 @@ $lblTitle.Location = New-Object System.Drawing.Point(0, 10)
 $lblTitle.Size = New-Object System.Drawing.Size(600, 30)
 $form.Controls.Add($lblTitle)
 
-# WinPE source folder
+# WinPE source folder (auto-installs via winget if empty)
 $lblWinPe = New-Object System.Windows.Forms.Label
-$lblWinPe.Text = "WinPE source folder:"
+$lblWinPe.Text = "WinPE source folder (optional - auto-installs ADK PE Addon):"
 $lblWinPe.Location = New-Object System.Drawing.Point(10, 50)
 $form.Controls.Add($lblWinPe)
 
@@ -266,18 +288,12 @@ $btnBrowseWinPe.Location = New-Object System.Drawing.Point(420, 70)
 $btnBrowseWinPe.Size = New-Object System.Drawing.Size(80, 26)
 $btnBrowseWinPe.Add_Click({
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
-    $dlg.Description = "Select WinPE source folder"
+    $dlg.Description = "Select WinPE source folder (contains boot.wim)"
     if ($dlg.ShowDialog($form) -eq [System.Windows.Forms.DialogResult]::OK) {
         $txtWinPe.Text = $dlg.SelectedPath
     }
 })
 $form.Controls.Add($btnBrowseWinPe)
-
-# Winget checkbox
-$chkWinget = New-Object System.Windows.Forms.CheckBox
-$chkWinget.Text = "Install ADK PE Addon via winget"
-$chkWinget.Location = New-Object System.Drawing.Point(10, 100)
-$form.Controls.Add($chkWinget)
 
 # USB drive
 $lblUsb = New-Object System.Windows.Forms.Label
@@ -340,14 +356,20 @@ if ($drives) {
 
 # Job tracking
 $job = $null
-$workingDir = $null
+$script:workingDir = $null
+$jobStartTime = $null
 
 $jobTimer = New-Object System.Windows.Forms.Timer
 $jobTimer.Interval = 1000
 $jobTimer.Add_Tick({
-    if ($job -and ($job.State -eq 'Completed' -or $job.State -eq 'Failed')) {
+    try {
+    if ($script:job -and $script:job.State -eq 'Running' -and $script:jobStartTime) {
+        $elapsed = [math]::Round(((Get-Date) - $script:jobStartTime).TotalMinutes, 1)
+        $btnCreate.Text = "Working... ($elapsed min)"
+    }
+    if ($script:job -and ($script:job.State -eq 'Completed' -or $script:job.State -eq 'Failed')) {
         $jobTimer.Stop()
-        $output = Receive-Job -Job $job -Keep
+        $output = Receive-Job -Job $script:job -Keep
         $lastStatus = ""
         $lastProgress = -1
         $result = $null
@@ -370,7 +392,6 @@ $jobTimer.Add_Tick({
 
             $cmbUsb.Enabled = $true
             $chkFormat.Enabled = $true
-            $chkWinget.Enabled = $true
             $btnBrowseWinPe.Enabled = $true
             $btnCreate.Enabled = $true
             $btnExit.Enabled = $true
@@ -384,22 +405,27 @@ $jobTimer.Add_Tick({
             }
 
             # Clean up temp dir
-            if ($workingDir -and (Test-Path $workingDir)) {
-                Remove-Item -Path $workingDir -Recurse -Force -ErrorAction SilentlyContinue
+            if ($script:workingDir -and (Test-Path $script:workingDir)) {
+                Remove-Item -Path $script:workingDir -Recurse -Force -ErrorAction SilentlyContinue
             }
-            Receive-Job -Job $job | Out-Null
-            Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-            $job = $null
-            $workingDir = $null
+            Receive-Job -Job $script:job | Out-Null
+            Remove-Job -Job $script:job -Force -ErrorAction SilentlyContinue
+            $script:job = $null
+            $script:workingDir = $null
+            $btnCreate.Text = "Create USB Drive"
+            $form.Cursor = [System.Windows.Forms.Cursors]::Default
         }
+    } } catch {
+        Add-Content -Path "$env:TEMP\\EEMTool.log" -Value "[$(Get-Date)] Timer tick error: $($_.Exception.Message)"
     }
 })
 
 # Create button click
 $btnCreate.Add_Click({
+    try {
+    Add-Content -Path "$env:TEMP\EEMTool.log" -Value ("[$(Get-Date)] Click handler started")
     $cmbUsb.Enabled = $false
     $chkFormat.Enabled = $false
-    $chkWinget.Enabled = $false
     $btnBrowseWinPe.Enabled = $false
     $btnCreate.Enabled = $false
     $btnExit.Enabled = $false
@@ -408,7 +434,6 @@ $btnCreate.Add_Click({
         [System.Windows.Forms.MessageBox]::Show("No removable USB drives detected.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
         $cmbUsb.Enabled = $true
         $chkFormat.Enabled = $true
-        $chkWinget.Enabled = $true
         $btnBrowseWinPe.Enabled = $true
         $btnCreate.Enabled = $true
         $btnExit.Enabled = $true
@@ -422,7 +447,6 @@ $btnCreate.Add_Click({
         if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) {
             $cmbUsb.Enabled = $true
             $chkFormat.Enabled = $true
-            $chkWinget.Enabled = $true
             $btnBrowseWinPe.Enabled = $true
             $btnCreate.Enabled = $true
             $btnExit.Enabled = $true
@@ -430,22 +454,11 @@ $btnCreate.Add_Click({
         }
     }
 
-    if (-not $chkWinget.Checked -and -not $txtWinPe.Text) {
-        [System.Windows.Forms.MessageBox]::Show("Please specify a WinPE source folder or check 'Install ADK PE Addon via winget'.", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
-        $cmbUsb.Enabled = $true
-        $chkFormat.Enabled = $true
-        $chkWinget.Enabled = $true
-        $btnBrowseWinPe.Enabled = $true
-        $btnCreate.Enabled = $true
-        $btnExit.Enabled = $true
-        return
-    }
-
     $winPeSource = if ($txtWinPe.Text) { $txtWinPe.Text.TrimEnd('\') } else { $null }
 
     # Create temp dir and decode embedded files
-    $workingDir = Join-Path $env:TEMP ("AutopilotUSB_" + [guid]::NewGuid().ToString())
-    New-Item -ItemType Directory -Force -Path $workingDir | Out-Null
+    $script:workingDir = Join-Path $env:TEMP ("AutopilotUSB_" + [guid]::NewGuid().ToString())
+    New-Item -ItemType Directory -Force -Path $script:workingDir | Out-Null
 
     # Resolve oa3tool.exe from disk: GUI override > script root > ADK default
     function Test-MzHeader { param([string]$Path) -not $Path }
@@ -499,12 +512,12 @@ $btnCreate.Add_Click({
             }
         } catch {
             $err = $_.Exception.Message
-            $resolveErrors += "Cannot read $resolved: $err"
+            $resolveErrors += "Cannot read ${resolved}: ${err}"
             Write-Output ""
             return $null
         }
         # Copy to working dir
-        Copy-Item -Path $resolved -Destination (Join-Path $workingDir $WorkDirName) -Force
+        Copy-Item -Path $resolved -Destination (Join-Path $script:workingDir $WorkDirName) -Force
         Write-Output "Copied $ScriptRootName to working dir."
     }
 
@@ -512,28 +525,51 @@ $btnCreate.Add_Click({
     Resolve-Binary $PcpkspOverride 'PCPKsp.dll' 'PCPKsp.dll'
 
     if ($resolveErrors.Count -gt 0) {
-        Write-Output "ERROR|$($resolveErrors -join '; ')"
-        Write-Output "RESULT|error|$($resolveErrors -join '; ')"
+        $errMsg = $resolveErrors -join '; '
+        Write-Output "ERROR|$errMsg"
+        Write-Output "RESULT|error|$errMsg"
+        $cmbUsb.Enabled = $true
+        $chkFormat.Enabled = $true
+        $btnBrowseWinPe.Enabled = $true
+        $btnCreate.Enabled = $true
+        $btnExit.Enabled = $true
+        $btnCreate.Text = "Create USB Drive"
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        [System.Windows.Forms.MessageBox]::Show("Binary resolution failed:$errMsg", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Add-Content -Path "$env:TEMP\EEMTool.log" -Value ("[$(Get-Date)] Binary resolution failed: $errMsg")
         return
     }
-    ConvertFrom-Base64ToFile $b64Extract (Join-Path $workingDir 'Extract-AutopilotHash.ps1')
-    ConvertFrom-Base64ToFile $b64OA3Cfg  (Join-Path $workingDir 'OA3.cfg')
-    ConvertFrom-Base64ToFile $b64InputXml(Join-Path $workingDir 'input.xml')
-    ConvertFrom-Base64ToFile $b64Startnet(Join-Path $workingDir 'startnet.cmd')
+    ConvertFrom-Base64ToFile $b64Extract (Join-Path $script:workingDir 'Extract-AutopilotHash.ps1')
+    ConvertFrom-Base64ToFile $b64OA3Cfg  (Join-Path $script:workingDir 'OA3.cfg')
+    ConvertFrom-Base64ToFile $b64InputXml(Join-Path $script:workingDir 'input.xml')
+    ConvertFrom-Base64ToFile $b64Startnet(Join-Path $script:workingDir 'startnet.cmd')
 
     # Start background job
-    $job = Start-Job -ScriptBlock $jobScript -ArgumentList @($usbDrive, $winPeSource, $chkFormat.Checked, $chkWinget.Checked, $workingDir)
+    $script:job = Start-Job -ScriptBlock $jobScript -ArgumentList @($usbDrive, $winPeSource, $chkFormat.Checked, $script:workingDir)
     $jobTimer.Start()
+    } catch {
+        $cmbUsb.Enabled = $true
+        $chkFormat.Enabled = $true
+        $btnBrowseWinPe.Enabled = $true
+        $btnCreate.Enabled = $true
+        $btnExit.Enabled = $true
+        $btnCreate.Text = "Create USB Drive"
+        $form.Cursor = [System.Windows.Forms.Cursors]::Default
+        $err = $_.Exception.Message
+        $pos = $_.InvocationInfo.PositionMessage
+        [System.Windows.Forms.MessageBox]::Show("Unexpected error:$err`n`n$pos", "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        Add-Content -Path "$env:TEMP\EEMTool.log" -Value ("[$(Get-Date)] Click handler error: $err`n$pos")
+    }
 })
 
 # Exit button click
 $btnExit.Add_Click({
-    if ($job) {
-        Stop-Job -Job $job -Force -ErrorAction SilentlyContinue
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-        $job = $null
+    if ($script:job) {
+        Stop-Job -Job $script:job -Force -ErrorAction SilentlyContinue
+        Remove-Job -Job $script:job -Force -ErrorAction SilentlyContinue
+        $script:job = $null
     }
-    if ($workingDir -and (Test-Path $workingDir)) {
+    if ($script:workingDir -and (Test-Path $script:workingDir)) {
         Remove-Item -Path $workingDir -Recurse -Force -ErrorAction SilentlyContinue
     }
     $form.Close()
@@ -541,12 +577,12 @@ $btnExit.Add_Click({
 
 # Form closing
 $form.Add_FormClosing({
-    if ($job) {
-        Stop-Job -Job $job -Force -ErrorAction SilentlyContinue
-        Remove-Job -Job $job -Force -ErrorAction SilentlyContinue
-        $job = $null
+    if ($script:job) {
+        Stop-Job -Job $script:job -Force -ErrorAction SilentlyContinue
+        Remove-Job -Job $script:job -Force -ErrorAction SilentlyContinue
+        $script:job = $null
     }
-    if ($workingDir -and (Test-Path $workingDir)) {
+    if ($script:workingDir -and (Test-Path $script:workingDir)) {
         Remove-Item -Path $workingDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 })
